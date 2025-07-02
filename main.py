@@ -1,118 +1,66 @@
 import discord
 from discord.ext import commands, tasks
+import requests
 import os
 import json
-import datetime
 import asyncio
+import datetime
 
-# Environment variables
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-TRN_API_KEY = os.getenv('TRN_API_KEY')
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
+BOT_TOKEN = os.environ['BOT_TOKEN']
+TRN_API_KEY = os.environ['TRN_API_KEY']
+LOG_CHANNEL_ID = int(os.environ['LOG_CHANNEL_ID'])  # Add this to your .env or secrets
 
-# Bot setup
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# Time tracking for uptime status
+# Uptime tracking
 start_time = datetime.datetime.utcnow()
 
-# Uptime status update loop (every 60 seconds)
-@tasks.loop(seconds=60)
-async def update_status():
-    uptime = datetime.datetime.utcnow() - start_time
-    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-    minutes, _ = divmod(remainder, 60)
-    status = f"Online for {hours}h {minutes}m"
-    await bot.change_presence(activity=discord.Game(name=status))
+# Load linked users
+try:
+    with open("linked_users.json", "r") as f:
+        linked_users = json.load(f)
+except FileNotFoundError:
+    linked_users = {}
 
-# Event when the bot is ready
-@bot.event
-async def on_ready():
-    print(f"✅ {bot.user.name} is online!")
-    await bot.change_presence(activity=discord.Game(name="Starting up..."))
-    update_status.start()
+# Save linked users
+def save_users():
+    with open("linked_users.json", "w") as f:
+        json.dump(linked_users, f, indent=2)
 
-    # Log bot online status
-    log_channel = bot.get_channel(LOG_CHANNEL_ID)
-    if log_channel:
-        await log_channel.send("✅ Bot restarted and is online.")
-
-# Class for the link account button
-class LinkAccountButton(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="🔗 Link Rocket League Account", style=discord.ButtonStyle.success, custom_id="link_account"))
-
-# Modal for username input
-class UsernameModal(discord.ui.Modal, title="Enter Your Rocket League Username"):
-    username = discord.ui.TextInput(label="Rocket League Username", required=True)
+class PlatformModal(discord.ui.Modal, title="Link Your Rocket League Account"):
+    username = discord.ui.TextInput(label="Username", placeholder="Enter your Rocket League username")
+    platform = discord.ui.TextInput(label="Platform (epic, steam, psn, xbl)", placeholder="e.g. epic")
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.send_message("Select your platform:", view=PlatformSelector(self.username.value), ephemeral=True)
+        user_id = str(interaction.user.id)
+        linked_users[user_id] = [self.platform.value.lower(), self.username.value]
+        save_users()
 
-# Platform selector buttons
-class PlatformSelector(discord.ui.View):
-    def __init__(self, username):
-        super().__init__(timeout=60)
-        self.username = username
+        await interaction.response.send_message(
+            f"✅ Linked `{self.username.value}` on `{self.platform.value}`!",
+            ephemeral=True
+        )
 
-        # Add platform buttons
-        for platform in ["steam", "epic", "psn", "xbl"]:
-            self.add_item(discord.ui.Button(label=platform.upper(), style=discord.ButtonStyle.primary, custom_id=f"platform_{platform}"))
+class LinkButtonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("❌ Linking canceled.", ephemeral=True)
+    @discord.ui.button(label="🔗 Link Your Rocket League Account", style=discord.ButtonStyle.success)
+    async def link_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PlatformModal())
 
-# Handle button interactions (link account)
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.type == discord.InteractionType.component:
-        if interaction.data["custom_id"] == "link_account":
-            try:
-                await interaction.response.send_modal(UsernameModal())
-            except discord.Forbidden:
-                await interaction.response.send_message("❌ I can't DM you. Please enable DMs!", ephemeral=True)
-
-        elif interaction.data["custom_id"].startswith("platform_"):
-            platform = interaction.data["custom_id"].split("_")[1]
-            user_id = str(interaction.user.id)
-            username = interaction.message.components[0].children[0].label  # Fallback to the username entered earlier
-
-            # Load existing linked users
-            try:
-                with open("linked_users.json", "r") as f:
-                    linked_users = json.load(f)
-            except FileNotFoundError:
-                linked_users = {}
-
-            # Add new linked user
-            linked_users[user_id] = {"platform": platform, "username": username}
-
-            # Save to linked_users.json
-            with open("linked_users.json", "w") as f:
-                json.dump(linked_users, f, indent=2)
-
-            # Send confirmation message
-            await interaction.response.send_message(f"✅ Linked `{username}` on `{platform.upper()}`!", ephemeral=True)
-
-            # Log the link action in the log channel
-            log_channel = bot.get_channel(LOG_CHANNEL_ID)
-            if log_channel:
-                await log_channel.send(f"🔗 {interaction.user.mention} linked `{username}` on `{platform.upper()}`.")
-
-# Command to post the link button
 @bot.command()
 async def post_link_button(ctx):
-    await ctx.send("🔗 Click below to link your Rocket League account:", view=LinkAccountButton())
+    view = LinkButtonView()
+    await ctx.send("🔧 Press the button to link your Rocket League account:", view=view)
 
-# Command to show linked users' stats (example)
 @bot.command()
 async def stats(ctx):
     user_id = str(ctx.author.id)
     if user_id not in linked_users:
-        await ctx.send("❌ You haven't linked your Rocket League account yet. Use `/post_link_button` to link.")
+        await ctx.send("❌ You haven't linked your Rocket League account yet. Use `/post_link_button`.")
         return
 
     platform, username = linked_users[user_id]
@@ -138,5 +86,56 @@ async def stats(ctx):
 
     await ctx.send(embed=embed)
 
-# Run the bot
+# Restart confirm view
+class RestartConfirmView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=30)
+        self.ctx = ctx
+
+    @discord.ui.button(label="✅ Confirm Restart", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("❌ Only the command author can confirm the restart.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🔁 Restarting bot now...", ephemeral=True)
+
+        save_users()
+        uptime = datetime.datetime.utcnow() - start_time
+        h, m, s = uptime.seconds // 3600, (uptime.seconds // 60) % 60, uptime.seconds % 60
+        uptime_str = f"{h}h {m}m {s}s"
+
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        if log_channel:
+            await log_channel.send(
+                f"🔁 Bot restarting (by {interaction.user.mention})\n🕒 Uptime: `{uptime_str}`"
+            )
+
+        await bot.change_presence(activity=discord.Game(name="Restarting..."))
+        await asyncio.sleep(2)
+        os._exit(0)
+
+@bot.command()
+@commands.is_owner()
+async def restart(ctx):
+    await ctx.send(
+        "⚠️ Are you sure you want to restart the bot?",
+        view=RestartConfirmView(ctx)
+    )
+
+# Dynamic status with uptime
+@tasks.loop(seconds=60)
+async def update_status():
+    uptime = datetime.datetime.utcnow() - start_time
+    h, m, s = uptime.seconds // 3600, (uptime.seconds // 60) % 60, uptime.seconds % 60
+    await bot.change_presence(activity=discord.Game(name=f"Online for {h}h {m}m {s}s"))
+
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user.name} is online!")
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send("✅ Bot is online and ready!")
+    update_status.start()
+
 bot.run(BOT_TOKEN)
