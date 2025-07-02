@@ -1,112 +1,134 @@
+import discord
+from discord.ext import commands, tasks
 import os
 import json
-import requests
-import discord
-from discord.ext import commands
-from discord import app_commands
-from dotenv import load_dotenv
-import traceback
+import datetime
+import asyncio
 
-load_dotenv()
+# Environment variables
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+TRN_API_KEY = os.getenv('TRN_API_KEY')
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TRN_API_KEY = os.getenv("TRN_API_KEY")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # Put your log channel ID here
-
-DATA_FILE = "linked_users.json"
-
+# Bot setup
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-# Load linked users from JSON file
-def load_linked_users():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# Time tracking for uptime status
+start_time = datetime.datetime.utcnow()
 
-# Save linked users to JSON file
-def save_linked_users(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# Uptime status update loop (every 60 seconds)
+@tasks.loop(seconds=60)
+async def update_status():
+    uptime = datetime.datetime.utcnow() - start_time
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    status = f"Online for {hours}h {minutes}m"
+    await bot.change_presence(activity=discord.Game(name=status))
 
-# Send log message helper
-async def send_log(message: str):
-    if LOG_CHANNEL_ID == 0:
-        return
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-        await channel.send(message)
+# Event when the bot is ready
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user.name} is online!")
+    await bot.change_presence(activity=discord.Game(name="Starting up..."))
+    update_status.start()
 
-linked_users = load_linked_users()
+    # Log bot online status
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send("✅ Bot restarted and is online.")
 
-class PlatformButtonView(discord.ui.View):
-    def __init__(self, username, user_id):
+# Class for the link account button
+class LinkAccountButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="🔗 Link Rocket League Account", style=discord.ButtonStyle.success, custom_id="link_account"))
+
+# Modal for username input
+class UsernameModal(discord.ui.Modal, title="Enter Your Rocket League Username"):
+    username = discord.ui.TextInput(label="Rocket League Username", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("Select your platform:", view=PlatformSelector(self.username.value), ephemeral=True)
+
+# Platform selector buttons
+class PlatformSelector(discord.ui.View):
+    def __init__(self, username):
         super().__init__(timeout=60)
         self.username = username
-        self.user_id = user_id
 
+        # Add platform buttons
         for platform in ["steam", "epic", "psn", "xbl"]:
-            self.add_item(discord.ui.Button(
-                label=platform.upper(),
-                style=discord.ButtonStyle.primary,
-                custom_id=platform
-            ))
+            self.add_item(discord.ui.Button(label=platform.upper(), style=discord.ButtonStyle.primary, custom_id=f"platform_{platform}"))
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
-        self.stop()
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("❌ Linking canceled.", ephemeral=True)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == int(self.user_id)
+# Handle button interactions (link account)
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type == discord.InteractionType.component:
+        if interaction.data["custom_id"] == "link_account":
+            try:
+                await interaction.response.send_modal(UsernameModal())
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ I can't DM you. Please enable DMs!", ephemeral=True)
 
-    async def interaction_handler(self, interaction: discord.Interaction):
-        platform = interaction.data['custom_id']
-        if platform in ["steam", "epic", "psn", "xbl"]:
-            linked_users[str(self.user_id)] = {"platform": platform, "username": self.username}
-            save_linked_users(linked_users)
-            await interaction.response.send_message(
-                f"✅ Linked `{self.username}` on **{platform.upper()}**.", ephemeral=True)
-            await send_log(f"🔗 User {interaction.user} linked Rocket League account: {self.username} on {platform.upper()}")
-            self.stop()
+        elif interaction.data["custom_id"].startswith("platform_"):
+            platform = interaction.data["custom_id"].split("_")[1]
+            user_id = str(interaction.user.id)
+            username = interaction.message.components[0].children[0].label  # Fallback to the username entered earlier
 
-    async def on_interaction(self, interaction: discord.Interaction):
-        await self.interaction_handler(interaction)
+            # Load existing linked users
+            try:
+                with open("linked_users.json", "r") as f:
+                    linked_users = json.load(f)
+            except FileNotFoundError:
+                linked_users = {}
 
-@tree.command(name="link", description="Link your Rocket League username to your Discord account")
-@app_commands.describe(username="Your Rocket League username")
-async def link_command(interaction: discord.Interaction, username: str):
-    view = PlatformButtonView(username, str(interaction.user.id))
-    await interaction.response.send_message(
-        f"👋 {interaction.user.mention}, choose your platform for **{username}**:", view=view, ephemeral=True
-    )
+            # Add new linked user
+            linked_users[user_id] = {"platform": platform, "username": username}
 
-@tree.command(name="stats", description="View your Rocket League stats")
-async def stats_command(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
+            # Save to linked_users.json
+            with open("linked_users.json", "w") as f:
+                json.dump(linked_users, f, indent=2)
+
+            # Send confirmation message
+            await interaction.response.send_message(f"✅ Linked `{username}` on `{platform.upper()}`!", ephemeral=True)
+
+            # Log the link action in the log channel
+            log_channel = bot.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                await log_channel.send(f"🔗 {interaction.user.mention} linked `{username}` on `{platform.upper()}`.")
+
+# Command to post the link button
+@bot.command()
+async def post_link_button(ctx):
+    await ctx.send("🔗 Click below to link your Rocket League account:", view=LinkAccountButton())
+
+# Command to show linked users' stats (example)
+@bot.command()
+async def stats(ctx):
+    user_id = str(ctx.author.id)
     if user_id not in linked_users:
-        await interaction.response.send_message(
-            "❌ You haven't linked your Rocket League account yet. Use `/link yourname`.", ephemeral=True)
+        await ctx.send("❌ You haven't linked your Rocket League account yet. Use `/post_link_button` to link.")
         return
 
-    platform = linked_users[user_id]["platform"]
-    username = linked_users[user_id]["username"]
-
+    platform, username = linked_users[user_id]
     url = f"https://api.tracker.gg/api/v2/rocket-league/standard/profile/{platform}/{username}"
     headers = {"TRN-Api-Key": TRN_API_KEY}
     r = requests.get(url, headers=headers)
 
     if r.status_code != 200:
-        await interaction.response.send_message("⚠️ Couldn't fetch your stats. Try again.", ephemeral=True)
+        await ctx.send("⚠️ Couldn't fetch your stats. Try again.")
         return
 
     stats = r.json()["data"]["segments"][0]["stats"]
     embed = discord.Embed(
         title=f"{username}'s Rocket League Stats",
         description=f"📊 Platform: `{platform.upper()}`",
-        color=0xff6600
+        color=0x00ffcc
     )
     embed.set_thumbnail(url="https://www.rocketleague.com/_next/static/media/rocket-league.6f2c3b84.svg")
     embed.add_field(name="🏆 Rank", value=stats['rating']['displayValue'], inline=True)
@@ -114,114 +136,7 @@ async def stats_command(interaction: discord.Interaction):
     embed.add_field(name="✅ Wins", value=stats['wins']['value'], inline=True)
     embed.add_field(name="🥅 Goals", value=stats['goals']['value'], inline=True)
 
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
-@tree.command(name="unlink", description="Unlink your Rocket League account")
-async def unlink_command(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    if user_id in linked_users:
-        linked_users.pop(user_id)
-        save_linked_users(linked_users)
-        await interaction.response.send_message("✅ Your Rocket League account has been unlinked.", ephemeral=True)
-        await send_log(f"❌ User {interaction.user} unlinked their Rocket League account.")
-    else:
-        await interaction.response.send_message("❌ You don't have an account linked.", ephemeral=True)
-
-@tree.command(name="platform", description="Change your linked platform")
-@app_commands.describe(platform="New platform to link")
-async def platform_command(interaction: discord.Interaction, platform: str):
-    user_id = str(interaction.user.id)
-    platform = platform.lower()
-    if platform not in ["steam", "epic", "psn", "xbl"]:
-        await interaction.response.send_message("❌ Invalid platform. Choose from steam, epic, psn, xbl.", ephemeral=True)
-        return
-
-    if user_id not in linked_users:
-        await interaction.response.send_message("❌ You have no linked account. Use `/link yourname` first.", ephemeral=True)
-        return
-
-    linked_users[user_id]["platform"] = platform
-    save_linked_users(linked_users)
-    await interaction.response.send_message(f"✅ Platform changed to **{platform.upper()}**.", ephemeral=True)
-    await send_log(f"🔄 User {interaction.user} changed platform to {platform.upper()}.")
-
-@tree.command(name="leaderboard", description="Show top 5 linked users by MMR")
-async def leaderboard_command(interaction: discord.Interaction):
-    if not linked_users:
-        await interaction.response.send_message("No linked users found.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🚀 OctaneCore Leaderboard - Top 5 by MMR",
-        color=0xff6600
-    )
-
-    results = []
-
-    for user_id, info in linked_users.items():
-        platform = info["platform"]
-        username = info["username"]
-        url = f"https://api.tracker.gg/api/v2/rocket-league/standard/profile/{platform}/{username}"
-        headers = {"TRN-Api-Key": TRN_API_KEY}
-        try:
-            r = requests.get(url, headers=headers)
-            if r.status_code == 200:
-                stats = r.json()["data"]["segments"][0]["stats"]
-                mmr = stats["rating"]["value"]
-                results.append((username, platform, mmr))
-        except Exception:
-            pass
-
-    results.sort(key=lambda x: x[2], reverse=True)
-    top_5 = results[:5]
-
-    if not top_5:
-        await interaction.response.send_message("Could not fetch leaderboard data.", ephemeral=True)
-        return
-
-    for i, (username, platform, mmr) in enumerate(top_5, start=1):
-        embed.add_field(name=f"{i}. {username} ({platform.upper()})", value=f"MMR: {mmr}", inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="help", description="Show commands list and usage")
-async def help_command(interaction: discord.Interaction):
-    help_text = """
-**OctaneCore Commands:**
-`/link <username>` - Link your Rocket League account.
-`/stats` - Show your linked Rocket League stats.
-`/unlink` - Unlink your Rocket League account.
-`/platform <platform>` - Change your linked platform (steam, epic, psn, xbl).
-`/leaderboard` - Show top 5 users by MMR.
-`/help` - Show this help message.
-"""
-    await interaction.response.send_message(help_text, ephemeral=True)
-
-@bot.event
-async def on_ready():
-    await tree.sync()
-    await bot.change_presence(activity=discord.Game(name="Rocket League Stats! 🚗💨"))
-    print(f"✅ OctaneCore is online as {bot.user}!")
-    await send_log(f"✅ OctaneCore is online as {bot.user}!")
-
-# Global error handler for command errors
-@bot.event
-async def on_command_error(ctx, error):
-    error_msg = f"⚠️ Error in command `{ctx.command}` by user {ctx.author}:\n```{error}```"
-    print(error_msg)
-    if LOG_CHANNEL_ID != 0:
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if channel:
-            await channel.send(error_msg)
-
-# Global error handler for app commands (slash commands)
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error):
-    error_msg = f"⚠️ Error in slash command by user {interaction.user}:\n```{error}```"
-    print(error_msg)
-    if LOG_CHANNEL_ID != 0:
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if channel:
-            await channel.send(error_msg)
-
+# Run the bot
 bot.run(BOT_TOKEN)
